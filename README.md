@@ -10,6 +10,18 @@ At the prompt of a Claude Code terminal session:
 /plugin install cc-todo --marketplace zihzihtw/cc-todo
 ```
 
+## Turn on the fullscreen layout
+
+cc-todo is built for Claude Code's fullscreen layout. Turn it on in `~/.claude/settings.json`:
+
+```json
+{
+  "tui": "fullscreen"
+}
+```
+
+Without it the pane still works, with less: it is drawn above the prompt instead of beside the chat, the fields are reached from the keyboard and cut long lines short, the note is rendered on save instead of as you type, and todos cannot be dragged.
+
 ## Use
 
 | Command | What it does |
@@ -26,14 +38,27 @@ In the pane:
 - **Notes** — a small markdown editor. The line under the cursor shows its source; every other line is rendered. Edits save as you type.
 - **All sessions** — one card per session, named by the title the resume list shows.
 
-The fields are click-to-focus: click one, type, and press Esc to hand the keyboard back to the prompt.
+In the fullscreen layout the fields are click-to-focus: click one, type, and press Esc to hand the keyboard back to the prompt. Elsewhere, press ctrl+x then tab to move the keyboard to the pane.
 
 ## Where the pane sits
 
-The pane docks to the right of the chat in the fullscreen layout once the terminal is at least 110 columns wide. Otherwise it is drawn above the prompt.
+In the fullscreen layout the pane docks to the right of the chat once the terminal is at least 110 columns wide. Below that width it is drawn above the prompt.
 
 ## Data
 
-Todos and notes are kept per session id in the plugin's own store under the Claude Code configuration directory, so `claude --resume` brings a session's list back. Nothing leaves the machine.
+Everything is kept in the plugin's own store, a JSON file under the Claude Code configuration directory on your machine. Nothing is sent anywhere.
 
-Session titles are read from the end of each session's transcript file, which is an internal format: if a future Claude Code changes it, sessions fall back to their first prompt as a name.
+For a session that has todos or a note, the store holds:
+
+| Kept | Why |
+| --- | --- |
+| The todos and the note | Shown in the pane; `claude --resume` brings them back |
+| The session's title | Names its card in the All sessions view |
+| The name of the folder it runs in | Shown on its card when it differs from the current folder |
+| When it was last used | Orders the cards |
+
+The title, folder name and time are refreshed when the session starts, on each prompt and when a todo changes. A session with no todos and no note keeps no record at all.
+
+The title is the one the resume list shows. To get it, the plugin reads up to the last 256 KiB of the session's transcript file, takes the title from it and keeps that title in its store on your machine. That file is an internal format, so the title may become unreadable in a future Claude Code: a session with neither a readable title nor one already kept shows as `Untitled session`.
+
+The store is plain text and is never cleaned up by Claude Code, so a session's todos and note stay until you clear them in the pane.
