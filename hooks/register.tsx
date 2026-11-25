@@ -730,6 +730,13 @@ export const register: Register = on => {
     const isNoteTab = (await read($, tab)) === 'note'
     const editedKey = await read($, edited)
     const draggedKey = await read($, dragged)
+    // The wrapping fields and the drag handle are surface modules, which take
+    // the keyboard and the pointer by a click. The terminal reports clicks in
+    // its fullscreen layout alone, so elsewhere the plain fields are drawn,
+    // which the focus ring reaches from the keyboard.
+    const hasPointer =
+      e.surface === 'desktop' ||
+      (e.surface === 'terminal' && e.viewport?.isFullscreen === true)
     const isDoneHidden = (await $.store.get(DONE_HIDDEN_KEY)) === true
     const textColumns = Math.max(8, e.props.bodyColumns - CELLS_AROUND_TEXT)
     const linesOf = (one: Todo): number =>
@@ -764,7 +771,7 @@ export const register: Register = on => {
         />
       )
 
-      if (e.surface === 'terminal' || e.surface === 'desktop') {
+      if (hasPointer && (e.surface === 'terminal' || e.surface === 'desktop')) {
         const { Client } = $.ui.resolve(e)
 
         return (
@@ -813,6 +820,7 @@ export const register: Register = on => {
     // The handle a todo is dragged by, where the surface draws one. It is
     // told how many lines the todos around it take, to read the pointer's row.
     const dragHandle = (session: SessionTodos, group: Todo[], index: number) => {
+      if (!hasPointer) return null
       if (e.surface !== 'terminal' && e.surface !== 'desktop') return null
       const { Client } = $.ui.resolve(e)
       const one = group[index]
@@ -999,7 +1007,7 @@ export const register: Register = on => {
     // The editor is a surface module, which the terminal and the desktop app
     // draw; elsewhere the note is shown as it reads.
     const editor = (session: SessionTodos) => {
-      if (e.surface === 'terminal' || e.surface === 'desktop') {
+      if (hasPointer && (e.surface === 'terminal' || e.surface === 'desktop')) {
         const { Client } = $.ui.resolve(e)
 
         return (
@@ -1012,17 +1020,30 @@ export const register: Register = on => {
         )
       }
 
-      return session.text === '' ? (
-        <Text dimColor>No notes yet</Text>
-      ) : (
-        <Markdown text={session.text} />
+      return (
+        <Box flexDirection="column">
+          {session.text !== '' && <Markdown text={session.text} />}
+          <Input
+            key="note-field"
+            rows={6}
+            placeholder="Write something…"
+            submitLabel=""
+            value={session.text}
+            onSubmit={value => {
+              void (async () => {
+                await saveNote($, value)
+                await redraw($)
+              })()
+            }}
+          />
+        </Box>
       )
     }
 
     // Where a new todo is typed: a field that wraps, where the surface draws
     // one (the editor's surface module), else the plain field.
     const newTodoField = () => {
-      if (e.surface === 'terminal' || e.surface === 'desktop') {
+      if (hasPointer && (e.surface === 'terminal' || e.surface === 'desktop')) {
         const { Client } = $.ui.resolve(e)
 
         return (
