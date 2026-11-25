@@ -62,3 +62,7 @@ The title, folder name and time are refreshed when the session starts, on each p
 The title is the one the resume list shows. To get it, the plugin reads up to the last 256 KiB of the session's transcript file, takes the title from it and keeps that title in its store on your machine. That file is an internal format, so the title may become unreadable in a future Claude Code: a session with neither a readable title nor one already kept shows as `Untitled session`.
 
 The store is plain text and is never cleaned up by Claude Code, so a session's todos and note stay until you clear them in the pane.
+
+## License
+
+[MIT](LICENSE)
