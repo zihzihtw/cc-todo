@@ -1,0 +1,6 @@
+{
+  "name": "cc-todo",
+  "version": "0.1.0",
+  "description": "A todo list and a markdown note for each session, in a pane beside the chat",
+  "types": "./types/index.d.ts"
+}
