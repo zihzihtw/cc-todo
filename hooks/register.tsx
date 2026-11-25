@@ -262,9 +262,12 @@ const CELLS_AROUND_TEXT = 15
 
 const redraw = ($: EngineInterface) => update($, changes, n => n + 1)
 
-// Each session has its own list, under its id. The id is read each time: a
-// /clear or a resume inside the process goes on under another id.
-const change = async (
+// A change reads the whole list and writes it back, so two at once could
+// each start from the same list and the later write drop the earlier one.
+// They are run one after another: each waits for the one before it.
+let lastChange: Promise<void> = Promise.resolve()
+
+const applyChange = async (
   $: EngineInterface,
   fn: (list: Todo[]) => Todo[],
   sessionId?: string,
@@ -272,9 +275,34 @@ const change = async (
   const ownId = await $.session.id()
   const id = sessionId ?? ownId
   const key = LIST_PREFIX + id
-  await $.store.set(key, fn(toTodos(await $.store.get(key))))
-  if (id === ownId) await touch($)
+  const changed = fn(toTodos(await $.store.get(key)))
+  if (changed.length === 0) await $.store.delete(key)
+  else await $.store.set(key, changed)
+  if (id === ownId) {
+    await touch($)
+  } else if (
+    changed.length === 0 &&
+    typeof (await $.store.get(TEXT_PREFIX + id)) !== 'string'
+  ) {
+    // Another session's last todo, and it has no note: its record goes with
+    // it. Its title and time are its own to refresh, so nothing else is done.
+    await $.store.delete(NOTE_PREFIX + id)
+  }
   await redraw($)
+}
+
+// Each session has its own list, under its id. The id is read each time: a
+// /clear or a resume inside the process goes on under another id.
+const change = (
+  $: EngineInterface,
+  fn: (list: Todo[]) => Todo[],
+  sessionId?: string,
+): Promise<void> => {
+  const applied = lastChange.then(() => applyChange($, fn, sessionId))
+  // A change that failed must not hold back the ones after it.
+  lastChange = applied.catch(() => undefined)
+
+  return applied
 }
 
 const add = (text: string) => (list: Todo[]) => {
