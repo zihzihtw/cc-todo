@@ -1,13 +1,19 @@
 export type Todo = { id: number; text: string; isDone: boolean }
 
-/** What is kept about a session beside its list, to name it among the others. */
+/**
+ * What is kept about a session that has todos or a note, to name it among
+ * the others: nothing the pane does not show.
+ */
 export type SessionNote = {
-  cwd: string
+  // The name of the folder the session runs in, not its path.
+  folder: string
   // When the session was last used: started, prompted, or its list changed.
   usedAt: number
-  // The title the resume list shows for the session; until its transcript
-  // has one, the first prompt seen in it, cut short.
+  // The title the resume list shows for the session, once it has one.
   name?: string
+  // Set where `name` was read from the session's transcript. A record
+  // without it holds a name from an earlier version, which is not kept.
+  isNameFromTitle?: boolean
   // Whether `name` is one the person gave with /rename, which no generated
   // title replaces.
   isNameCustom?: boolean

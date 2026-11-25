@@ -51,9 +51,20 @@ const toTodos = (stored: unknown): Todo[] => {
   return todos
 }
 
+const folderNameOf = (path: string): string =>
+  path.split('/').filter(Boolean).pop() ?? ''
+
 const toNote = (stored: unknown): SessionNote | undefined => {
   if (typeof stored !== 'object' || stored === null) return undefined
-  if (!('cwd' in stored) || typeof stored.cwd !== 'string') return undefined
+  // A record written before only the folder's name was kept holds the whole
+  // path as `cwd`; its last part is all that is read from it.
+  const folder =
+    'folder' in stored && typeof stored.folder === 'string'
+      ? stored.folder
+      : 'cwd' in stored && typeof stored.cwd === 'string'
+        ? folderNameOf(stored.cwd)
+        : undefined
+  if (folder === undefined) return undefined
   // `changedAt` is what a note written before `usedAt` carries.
   const usedAt =
     'usedAt' in stored
@@ -62,17 +73,27 @@ const toNote = (stored: unknown): SessionNote | undefined => {
         ? stored.changedAt
         : undefined
   if (typeof usedAt !== 'number') return undefined
-  const name =
-    'name' in stored && typeof stored.name === 'string' ? stored.name : undefined
   const isNameCustom = 'isNameCustom' in stored && stored.isNameCustom === true
-  const note: SessionNote = { cwd: stored.cwd, usedAt }
-  if (name !== undefined) note.name = name
+  // An earlier version could name a session by the start of its first
+  // prompt. Only a name marked as read from the transcript is kept, or one
+  // the person gave with /rename, which was always read from there.
+  const isNameFromTitle =
+    isNameCustom ||
+    ('isNameFromTitle' in stored && stored.isNameFromTitle === true)
+  const name =
+    isNameFromTitle && 'name' in stored && typeof stored.name === 'string'
+      ? stored.name
+      : undefined
+  const note: SessionNote = { folder, usedAt }
+  if (name !== undefined) {
+    note.name = name
+    note.isNameFromTitle = true
+  }
   if (isNameCustom) note.isNameCustom = true
 
   return note
 }
 
-const NAME_MAX_LENGTH = 40
 // How much of the transcript's end is searched for a title: the engine writes
 // the title again as the session goes on, so the newest is near the end.
 const TITLE_TAIL_BYTES = 262144
@@ -124,20 +145,25 @@ const readTitle = async ($: EngineInterface): Promise<Title | undefined> => {
   }
 }
 
-// Marks this session as used now and brings its name up to date: the resume
-// list's title where the transcript has one, else the first prompt seen.
-const touch = async ($: EngineInterface, prompt?: string): Promise<void> => {
-  const key = NOTE_PREFIX + (await $.session.id())
+// Marks this session as used now and brings its name up to date with the
+// resume list's title. A record is kept only for a session that has todos or
+// a note: one with neither leaves nothing behind.
+const touch = async ($: EngineInterface): Promise<void> => {
+  const sessionId = await $.session.id()
+  const key = NOTE_PREFIX + sessionId
+  const hasTodos =
+    toTodos(await $.store.get(LIST_PREFIX + sessionId)).length > 0
+  const hasText = typeof (await $.store.get(TEXT_PREFIX + sessionId)) === 'string'
+  if (!hasTodos && !hasText) {
+    await $.store.delete(key)
+
+    return
+  }
+
   const kept = toNote(await $.store.get(key))
   const title = await readTitle($)
-  const firstLine = prompt?.trim().split('\n')[0] ?? ''
-  const fromPrompt =
-    firstLine !== '' && !firstLine.startsWith('/')
-      ? firstLine.slice(0, NAME_MAX_LENGTH)
-      : undefined
-
   const note: SessionNote = {
-    cwd: await $.session.cwd(),
+    folder: folderNameOf(await $.session.cwd()),
     usedAt: await $.clock.now(),
   }
   if (title?.isCustom === true) {
@@ -147,10 +173,46 @@ const touch = async ($: EngineInterface, prompt?: string): Promise<void> => {
     note.name = kept.name
     note.isNameCustom = true
   } else {
-    const name = title?.text ?? kept?.name ?? fromPrompt
+    const name = title?.text ?? kept?.name
     if (name !== undefined) note.name = name
   }
+  if (note.name !== undefined) note.isNameFromTitle = true
   await $.store.set(key, note)
+}
+
+// Brings the records an earlier version left to what is kept now: the
+// folder's name in place of its path, and none for a session with nothing.
+// Saves this session's note. The session's record is brought up to date when
+// the note is its first or was its last, so that a session gets its title
+// with its first note and leaves no record once it holds nothing. Other
+// saves leave the record to the next prompt: the editor saves on every key.
+const saveNote = async ($: EngineInterface, text: string): Promise<void> => {
+  const key = TEXT_PREFIX + (await $.session.id())
+  const hadText = typeof (await $.store.get(key)) === 'string'
+  const hasText = text.trim() !== ''
+  if (hasText) await $.store.set(key, text)
+  else await $.store.delete(key)
+  if (hadText !== hasText) {
+    await touch($)
+    await redraw($)
+  }
+}
+
+const tidyRecords = async ($: EngineInterface): Promise<void> => {
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(NOTE_PREFIX)) continue
+    const sessionId = key.slice(NOTE_PREFIX.length)
+    const note = toNote(await $.store.get(key))
+    const hasTodos =
+      toTodos(await $.store.get(LIST_PREFIX + sessionId)).length > 0
+    const hasText =
+      typeof (await $.store.get(TEXT_PREFIX + sessionId)) === 'string'
+    if (note === undefined || (!hasTodos && !hasText)) {
+      await $.store.delete(key)
+    } else {
+      await $.store.set(key, note)
+    }
+  }
 }
 
 const tab = atom({ plugin: 'cc-todo', key: 'tab' } as const, 'todo')
@@ -279,7 +341,7 @@ const readSessions = async (
 const twoDigits = (n: number): string => String(n).padStart(2, '0')
 
 const folderOf = (session: SessionTodos): string =>
-  session.note?.cwd.split('/').filter(Boolean).pop() ?? '?'
+  session.note?.folder ?? '?'
 
 const nameOf = (session: SessionTodos): string =>
   session.note?.name ?? 'Untitled session'
@@ -388,6 +450,7 @@ export const register: Register = on => {
       argumentHint: '[text | note | all | close]',
     })
     await adoptSharedList($)
+    await tidyRecords($)
     await touch($)
     await redraw($)
     // A reload runs this again: a pane the person closed, minimised or that
@@ -467,9 +530,7 @@ export const register: Register = on => {
       'text' in posted &&
       typeof posted.text === 'string'
     ) {
-      const key = TEXT_PREFIX + sessionId
-      if (posted.text.trim() === '') await $.store.delete(key)
-      else await $.store.set(key, posted.text)
+      await saveNote($, posted.text)
     }
 
     // A drag handle posts how far its todo is held from its place, and once
