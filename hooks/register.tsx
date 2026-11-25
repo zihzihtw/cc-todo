@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, PaneOpenArgs, Register } from 'claude-code'
 
 import type { SessionNote, Todo } from '../types'
 
@@ -13,6 +13,11 @@ const NOTE_PREFIX = 'note:'
 const TEXT_PREFIX = 'text:'
 // The fullscreen layout docks a pane beside the transcript from this width.
 const DOCK_MIN_COLUMNS = 110
+// The rows the pane asks for while it sits above the prompt.
+const INLINE_ROWS = 8
+// A draft past this many cells or lines needs the rows an inline pane holds.
+const LONG_DRAFT_CELLS = 140
+const LONG_DRAFT_LINES = 3
 // Set once the pane is closed, so a later start or reload leaves it closed
 // until the person asks for it again.
 const CLOSED_KEY = 'isPaneClosed'
@@ -152,6 +157,10 @@ const tab = atom({ plugin: 'cc-todo', key: 'tab' } as const, 'todo')
 const edited = atom({ plugin: 'cc-todo', key: 'edited' } as const, '')
 
 const dragged = atom({ plugin: 'cc-todo', key: 'dragged' } as const, '')
+const isCollapsed = atom(
+  { plugin: 'cc-todo', key: 'isCollapsed' } as const,
+  false,
+)
 
 // Moves the todo `id` by `steps` places among the todos that are done as it
 // is (the pane lists the open ones, then the done ones).
@@ -300,6 +309,76 @@ const MARK = '#e8825a'
 const DONE = '#7fd88f'
 const BAR_CELLS = 10
 
+// The pane leaves the screen in two ways, and a row above the prompt stands
+// in for it both times, bringing it back at a press.
+//
+// Minimised by the person (`isCollapsed`), it is closed: docked, that gives
+// the whole column back, which no narrower pane could.
+//
+// Above the prompt, a long draft has no room left under it, however few rows
+// the pane keeps: the pane is closed as the draft grows (`isTucked`). A prompt
+// sent brings it back. A draft cut short or cancelled cannot: on a narrow
+// terminal the surface seats a pane only behind the person's own command,
+// prompt or press, hence the row.
+//
+// The row itself is hidden while the draft is long. Where the pane is seated
+// is kept in the session's state, which a reload of this module does not
+// lose; `seating` is this module's copy of it, so a key typed costs no read.
+type Seating = { isInline: boolean; isTucked: boolean; isDraftLong: boolean }
+
+const DOCKED: Seating = { isInline: false, isTucked: false, isDraftLong: false }
+const INLINE: Seating = { isInline: true, isTucked: false, isDraftLong: false }
+
+const seatingState = atom(
+  { plugin: 'cc-todo', key: 'seating' } as const,
+  DOCKED,
+)
+let seating: Seating | undefined
+// Where the surface seated the pane, as its last drawing was told: known for
+// a pane this module did not open behind a command, and after the seat
+// changes. Absent until the pane is drawn, and once it is closed.
+let drawnSeat: 'dock' | 'inline' | 'widget' | undefined
+
+const seatingOf = async ($: EngineInterface): Promise<Seating> => {
+  seating ??= await read($, seatingState)
+
+  return seating
+}
+
+const seatAs = async ($: EngineInterface, next: Seating): Promise<void> => {
+  seating = next
+  await update($, seatingState, () => next)
+}
+
+// How the pane is opened: its width where it docks, its rows where it sits
+// above the prompt; each seat reads its own and ignores the other.
+const SEAT: PaneOpenArgs = {
+  id: PANE,
+  title: TITLE,
+  columns: 36,
+  backgroundColor: 'transparent',
+  rows: INLINE_ROWS,
+}
+
+// Brings the pane back from either way it left. Called behind the person's
+// command, prompt or press, which is what seats it at any width.
+const bringBack = async (
+  $: EngineInterface,
+  isInline: boolean,
+): Promise<void> => {
+  // Where the surface does not seat it, it stays away and the row that
+  // offers it stays up.
+  const opened = await $.ui.open(SEAT)
+  if (!opened.isPlaced) return
+  const { isDraftLong } = await seatingOf($)
+  await update($, isCollapsed, () => false)
+  await seatAs($, { isInline, isTucked: false, isDraftLong })
+}
+
+const isLongDraft = (text: string): boolean =>
+  text.split('\n').length >= LONG_DRAFT_LINES ||
+  cellsOf(text) > LONG_DRAFT_CELLS
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -311,15 +390,26 @@ export const register: Register = on => {
     await adoptSharedList($)
     await touch($)
     await redraw($)
-    if ((await $.store.get(CLOSED_KEY)) !== true) {
-      void $.ui.open({ id: PANE, title: TITLE, columns: 36, backgroundColor: 'transparent' })
+    // A reload runs this again: a pane the person closed, minimised or that
+    // is put away for a draft stays as it is.
+    const isAway =
+      (await read($, isCollapsed)) || (await seatingOf($)).isTucked
+    if (!isAway && (await $.store.get(CLOSED_KEY)) !== true) {
+      void $.ui.open(SEAT)
     }
 
     return next(e)
   })
 
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE && e.origin.kind !== 'unload') {
+    // Put away for a draft, the pane is not one the person closed.
+    // Minimised or put away for a draft, the pane is not one the person
+    // closed for good.
+    const isAway =
+      (await read($, isCollapsed)) || (await seatingOf($)).isTucked
+    if (e.id === PANE) drawnSeat = undefined
+    if (e.id === PANE && e.origin.kind !== 'unload' && !isAway) {
+      await seatAs($, DOCKED)
       await $.store.set(CLOSED_KEY, true)
     }
 
@@ -328,8 +418,38 @@ export const register: Register = on => {
 
   // A /clear or a resume changes the session without a session.start: the
   // next prompt draws the list of the session it belongs to.
+  on('prompt.change', async ($, e, next) => {
+    const isLong = isLongDraft(e.text)
+    const seated = await seatingOf($)
+    // Nothing to do but where the draft crosses from short to long or back.
+    if (seated.isDraftLong !== isLong) {
+      const isInline =
+        drawnSeat === undefined ? seated.isInline : drawnSeat === 'inline'
+      const isPutAway =
+        isLong &&
+        isInline &&
+        !seated.isTucked &&
+        !(await read($, isCollapsed))
+      await seatAs($, {
+        isInline: seated.isInline || isPutAway,
+        isDraftLong: isLong,
+        isTucked: seated.isTucked || isPutAway,
+      })
+      if (isPutAway) await $.ui.close({ id: PANE })
+    }
+
+    return next(e)
+  })
+
   on('prompt.submit', async ($, e, next) => {
-    await touch($, e.text)
+    // The prompt is sent: the draft is gone, and a pane put away for it
+    // comes back. One the person minimised stays minimised.
+    const seated = await seatingOf($)
+    if (seated.isTucked) {
+      await seatAs($, { ...seated, isDraftLong: false })
+      void bringBack($, true)
+    }
+    await touch($)
     await redraw($)
 
     return next(e)
@@ -430,6 +550,13 @@ export const register: Register = on => {
     await touch($)
     const text = e.args.trim()
     const { isFullscreen, columns } = e.presentation
+    // Above the prompt the pane shares the screen's height with the prompt
+    // box, so it asks for a few rows and scrolls, leaving room to type.
+    const isDocked = isFullscreen && columns >= DOCK_MIN_COLUMNS
+    const seat = SEAT
+    await seatAs($, !isDocked && text !== 'close' ? INLINE : DOCKED)
+    // Asking for the pane brings it back from minimised.
+    await update($, isCollapsed, () => false)
     const whereDrawn = !isFullscreen
       ? ' Not in fullscreen layout, so the pane sits above the prompt. It docks on the right in fullscreen at 110+ columns.'
       : columns < DOCK_MIN_COLUMNS
@@ -437,6 +564,9 @@ export const register: Register = on => {
         : ''
 
     if (text === 'close') {
+      // Kept here, not left to the close event: a pane already away, minimised
+      // or put away for a draft, has nothing left to close and raises none.
+      await $.store.set(CLOSED_KEY, true)
       await $.ui.close({ id: PANE })
 
       return { text: 'Todo pane closed. /todo opens it again.' }
@@ -446,14 +576,14 @@ export const register: Register = on => {
 
     if (text === 'note') {
       await update($, tab, () => 'note')
-      await $.ui.open({ id: PANE, title: TITLE, columns: 36, backgroundColor: 'transparent', focus: true, closeOnEscape: true })
+      await $.ui.open({ ...seat, focus: true })
 
       return { text: `Notes tab opened.${whereDrawn}` }
     }
 
     if (text === 'all') {
       await update($, isAllShown, () => true)
-      await $.ui.open({ id: PANE, title: TITLE, columns: 36, backgroundColor: 'transparent', focus: true, closeOnEscape: true })
+      await $.ui.open({ ...seat, focus: true })
 
       return { text: `Showing all sessions.${whereDrawn}` }
     }
@@ -461,20 +591,51 @@ export const register: Register = on => {
     if (text !== '') {
       await update($, tab, () => 'todo')
       await change($, add(text))
-      await $.ui.open({ id: PANE, title: TITLE, columns: 36, backgroundColor: 'transparent' })
+      await $.ui.open(seat)
 
       return { text: `Added: ${text}` }
     }
 
     await update($, isAllShown, () => false)
     await redraw($)
-    await $.ui.open({ id: PANE, title: TITLE, columns: 36, backgroundColor: 'transparent', focus: true, closeOnEscape: true })
+    await $.ui.open({ ...seat, focus: true })
 
     return { text: `Todo pane opened.${whereDrawn}` }
   })
 
+  // The row that stands in for the pane while it is minimised or put away.
+  // A press on it is the person's own, which seats the pane at any width.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const seated = await read($, seatingState)
+    const isMinimised = await read($, isCollapsed)
+    if (seated.isDraftLong || (!isMinimised && !seated.isTucked)) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    await read($, changes)
+    const openCount = toTodos(
+      await $.store.get(LIST_PREFIX + (await $.session.id())),
+    ).filter(one => !one.isDone).length
+    // Where it will be seated: docked from the width the layout docks at.
+    const isInline = !(
+      e.viewport?.isFullscreen === true &&
+      e.viewport.columns >= DOCK_MIN_COLUMNS
+    )
+
+    return (
+      <Box>
+        <Button key="bring-back" plain onPress={() => bringBack($, isInline)}>
+          <Text dimColor>▸ </Text>
+          <Text bold color={MARK}>
+            Todo
+          </Text>
+          <Text dimColor> {openCount} open</Text>
+        </Button>
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input, Markdown } = $.ui.resolve(e)
+    drawnSeat = e.props.placement
     await read($, changes)
     const isEverySession = await read($, isAllShown)
     const isNoteTab = (await read($, tab)) === 'note'
@@ -848,6 +1009,12 @@ export const register: Register = on => {
       )
     }
 
+    // Minimising closes the pane; the row above the prompt then stands in.
+    const fold = async (): Promise<void> => {
+      await update($, isCollapsed, () => true)
+      await $.ui.close({ id: PANE })
+    }
+
     const shown = sessions.filter(
       session =>
         session.isOwn ||
@@ -857,8 +1024,19 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" paddingX={1}>
         <Box flexDirection="row" justifyContent="space-between">
+          {/* The fold mark leads the heading as a disclosure triangle, the
+              same place it takes when the pane is folded. */}
           <Box flexDirection="row" gap={2}>
-            {tabButton('todo', 'Todo')}
+            <Box flexDirection="row" gap={1}>
+              <Button
+                key="fold"
+                label="▾"
+                plain
+                dimColor
+                onPress={() => fold()}
+              />
+              {tabButton('todo', 'Todo')}
+            </Box>
             {tabButton('note', 'Notes')}
           </Box>
           {isEverySession && <Text dimColor>all sessions</Text>}
@@ -874,7 +1052,7 @@ export const register: Register = on => {
           </Box>
         )}
         {shown.map(isNoteTab ? noteCard : card)}
-        <Box flexDirection="row" justifyContent="space-between" marginTop={1}>
+        <Box flexDirection="row" justifyContent="flex-end" marginTop={1}>
           <Button
             key="toggle-scope"
             plain
@@ -884,14 +1062,6 @@ export const register: Register = on => {
               {isEverySession ? 'This session' : 'All sessions'}
             </Text>
           </Button>
-          <Button
-            key="close-pane"
-            label="Close esc"
-            role="dismiss"
-            plain
-            dimColor
-            onPress={() => $.ui.close({ id: PANE })}
-          />
         </Box>
       </Box>
     )

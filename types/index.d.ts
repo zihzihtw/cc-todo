@@ -29,6 +29,13 @@ declare module 'claude-code' {
       // The todo being dragged and how many todos away it is held, as
       // `<session id>:<todo id>:<steps>`; empty while none is dragged.
       dragged: string
+      // Whether the pane is minimised: closed, with a row above the prompt
+      // standing in for it.
+      isCollapsed: boolean
+      // Where the pane is seated: above the prompt (`isInline`) and put away
+      // there while a long draft needs its rows (`isTucked`); and whether the
+      // draft is long now (`isDraftLong`), which hides the row above the prompt.
+      seating: { isInline: boolean; isTucked: boolean; isDraftLong: boolean }
     }
   }
 }
