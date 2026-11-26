@@ -34,7 +34,7 @@ Without it the pane still works, with less: it is drawn above the prompt instead
 
 In the pane:
 
-- **Todo** — click the circle to tick a todo, `✎` to edit it, `×` to remove it, and drag `≡` to reorder. `Hide done` folds finished todos away; `Clear done` deletes them.
+- **Todo** — click the circle to tick a todo, its text to edit it, `×` to remove it, and drag `≡` to reorder. An edit is saved on Enter or by clicking elsewhere in the pane; `cancel` drops it. `Hide done` folds finished todos away; `Clear done` deletes them.
 - **Notes** — a small markdown editor. The line under the cursor shows its source; every other line is rendered. Edits save as you type.
 - **All sessions** — one card per session, named by the title the resume list shows.
 
