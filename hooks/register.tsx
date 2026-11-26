@@ -257,8 +257,13 @@ const cellsOf = (text: string): number =>
   }, 0)
 
 // What the pane's body loses to the card around a todo's text: the padding,
-// the border, the circle, the margins and the three marks at the row's end.
-const CELLS_AROUND_TEXT = 15
+// the border, the circle, the margins and the two marks at the row's end.
+const CELLS_AROUND_TEXT = 13
+
+// What the field of the todo being edited holds, under the field's key, as
+// it last changed: what is saved when the person leaves the field for
+// something else in the pane.
+let fieldDraft: { key: string; text: string } | undefined
 
 const redraw = ($: EngineInterface) => update($, changes, n => n + 1)
 
@@ -303,6 +308,41 @@ const change = (
   lastChange = applied.catch(() => undefined)
 
   return applied
+}
+
+// Ends the edit of the todo marked as edited, with `value` as its text
+// unless that is empty, which leaves the text as it was.
+const saveEdited = async ($: EngineInterface, value: string): Promise<void> => {
+  const [editedSession, editedId] = (await read($, edited)).split(':')
+  if (editedSession === undefined || editedId === undefined) return
+  // A todo is one line: a newline typed in a field of several rows is a space.
+  const text = value.replace(/\s*\n\s*/g, ' ').trim()
+  if (text !== '') {
+    await change(
+      $,
+      all =>
+        all.map(each =>
+          String(each.id) === editedId ? { ...each, text } : each,
+        ),
+      editedSession,
+    )
+  }
+  fieldDraft = undefined
+  await update($, edited, () => '')
+}
+
+// Saves the field of the todo being edited as the person turns to `element`,
+// another part of the pane; the field itself and its cancel are no leaving.
+const leaveField = async (
+  $: EngineInterface,
+  element: string | undefined,
+): Promise<void> => {
+  const [editedSession, editedId] = (await read($, edited)).split(':')
+  if (editedSession === undefined || editedId === undefined) return
+  const key = `edit-${editedSession}-${editedId}`
+  if (fieldDraft?.key !== key) return
+  if (element === key || element === `cancel-${key}`) return
+  await saveEdited($, fieldDraft.text)
 }
 
 const add = (text: string) => (list: Todo[]) => {
@@ -551,6 +591,9 @@ export const register: Register = on => {
   on('ui.message', async ($, e, next) => {
     const sessionId = await $.session.id()
     const posted = e.data
+    // A post from anything but the field of the todo being edited, the free
+    // room under the rows included, is the person having left that field.
+    await leaveField($, e.element)
     if (
       e.element === `note-${sessionId}` &&
       typeof posted === 'object' &&
@@ -584,44 +627,20 @@ export const register: Register = on => {
       }
     }
 
-    // The field new todos are typed in posts its text on Enter.
-    if (
-      e.element === 'new-todo' &&
-      typeof posted === 'object' &&
-      posted !== null &&
-      'submit' in posted &&
-      typeof posted.submit === 'string' &&
-      posted.submit.trim() !== ''
-    ) {
-      await change($, add(posted.submit.trim()))
-    }
+    return next(e)
+  })
 
-    // The field of the todo being edited posts its text on Enter. Which todo
-    // is the one marked as edited, never what the post names.
-    const editedKey = await read($, edited)
-    const [editedSession, editedId] = editedKey.split(':')
-    if (
-      editedSession !== undefined &&
-      editedId !== undefined &&
-      e.element === `edit-${editedSession}-${editedId}` &&
-      typeof posted === 'object' &&
-      posted !== null &&
-      'submit' in posted &&
-      typeof posted.submit === 'string'
-    ) {
-      const text = posted.submit.trim()
-      if (text !== '') {
-        await change(
-          $,
-          all =>
-            all.map(each =>
-              String(each.id) === editedId ? { ...each, text } : each,
-            ),
-          editedSession,
-        )
-      }
-      await update($, edited, () => '')
-    }
+  // Leaving the field of the todo being edited for something else in the
+  // pane saves what it holds, as Enter does: the ring moved by a click or
+  // the keys, or a button pressed. Its own cancel is left to discard it.
+  on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person') await leaveField($, e.element)
+
+    return next(e)
+  })
+
+  on('ui.press', { requestId: PANE }, async ($, e, next) => {
+    await leaveField($, e.element)
 
     return next(e)
   })
@@ -745,74 +764,40 @@ export const register: Register = on => {
     const ownFolder =
       (await $.session.cwd()).split('/').filter(Boolean).pop() ?? ''
 
-    // The row of the todo being edited: its text in a field that wraps, where
-    // the surface draws one (the editor's surface module), else the plain field.
+    // The row of the todo being edited: its text in a plain field as tall as
+    // the text's lines. A plain field takes the keyboard as it is drawn, which
+    // a surface module does only by a click of its own.
     const field = (session: SessionTodos, one: Todo) => {
       const key = `edit-${session.sessionId}-${one.id}`
-      const save = async (value: string): Promise<void> => {
-        const text = value.trim()
-        if (text !== '') {
-          await change(
-            $,
-            all =>
-              all.map(each => (each.id === one.id ? { ...each, text } : each)),
-            session.sessionId,
-          )
-        }
-        await update($, edited, () => '')
-      }
-      const cancel = (
-        <Button
-          key={`cancel-edit-${session.sessionId}-${one.id}`}
-          label="cancel"
-          plain
-          dimColor
-          onPress={() => update($, edited, () => '')}
-        />
-      )
-
-      if (hasPointer && (e.surface === 'terminal' || e.surface === 'desktop')) {
-        const { Client } = $.ui.resolve(e)
-
-        return (
-          <Box flexDirection="row">
-            <Text color={one.isDone ? DONE : BORDER}>
-              {one.isDone ? '●' : '○'}
-            </Text>
-            <Box
-              flexDirection="column"
-              flexGrow={1}
-              flexShrink={1}
-              marginLeft={1}
-            >
-              <Client
-                key={key}
-                module="./note-editor.tsx"
-                props={{ text: one.text, isOneLine: true }}
-                width="100%"
-              />
-              <Box flexDirection="row" justifyContent="flex-end">
-                {cancel}
-              </Box>
-            </Box>
-          </Box>
-        )
-      }
+      if (fieldDraft?.key !== key) fieldDraft = { key, text: one.text }
 
       return (
-        <Box flexDirection="row" gap={1}>
-          <Box flexGrow={1}>
+        <Box flexDirection="row">
+          <Text color={one.isDone ? DONE : BORDER}>
+            {one.isDone ? '●' : '○'}
+          </Text>
+          <Box flexDirection="column" flexGrow={1} flexShrink={1} marginLeft={1}>
             <Input
               key={key}
               value={one.text}
               submitLabel=""
+              rows={linesOf(one)}
               autoFocus
-              onSubmit={value => {
-                void save(value)
+              onInput={value => {
+                fieldDraft = { key, text: value }
               }}
+              onSubmit={value => saveEdited($, value)}
             />
+            <Box flexDirection="row" justifyContent="flex-end">
+              <Button
+                key={`cancel-${key}`}
+                label="cancel"
+                plain
+                dimColor
+                onPress={() => update($, edited, () => '')}
+              />
+            </Box>
           </Box>
-          {cancel}
         </Box>
       )
     }
@@ -893,33 +878,39 @@ export const register: Register = on => {
           )}
         </Button>
         {/* The text has the row's free width and wraps within it, so its
-            later lines start under its first, past the circle. */}
+            later lines start under its first, past the circle. Pressing it
+            turns the row into the field that edits it. */}
         <Box flexGrow={1} flexShrink={1} marginLeft={1} marginRight={1}>
-          {one.isDone ? (
-            <Text dimColor strikethrough wrap="wrap">
-              {one.text}
-            </Text>
-          ) : (
-            <Text
-              wrap="wrap"
-              dimColor={isDragged}
-              {...(isTarget ? { color: MARK } : {})}
-            >
-              {one.text}
-            </Text>
-          )}
+          <Button
+            key={`edit-button-${session.sessionId}-${one.id}`}
+            plain
+            onPress={async () => {
+              await update($, edited, () => `${session.sessionId}:${one.id}`)
+              // The press gave the pane the keys: the field takes them now,
+              // with no click of its own.
+              await $.ui.focus({
+                requestId: PANE,
+                key: `edit-${session.sessionId}-${one.id}`,
+              })
+            }}
+          >
+            {one.isDone ? (
+              <Text dimColor strikethrough wrap="wrap">
+                {one.text}
+              </Text>
+            ) : (
+              <Text
+                wrap="wrap"
+                dimColor={isDragged}
+                {...(isTarget ? { color: MARK } : {})}
+              >
+                {one.text}
+              </Text>
+            )}
+          </Button>
         </Box>
         <Box flexDirection="row" gap={1} flexShrink={0}>
         {dragHandle(session, group, index)}
-        <Button
-          key={`edit-button-${session.sessionId}-${one.id}`}
-          label="✎"
-          plain
-          dimColor
-          onPress={() =>
-            update($, edited, () => `${session.sessionId}:${one.id}`)
-          }
-        />
         <Button
           key={`remove-${session.sessionId}-${one.id}`}
           label="×"
@@ -1040,32 +1031,9 @@ export const register: Register = on => {
       )
     }
 
-    // Where a new todo is typed: a field that wraps, where the surface draws
-    // one (the editor's surface module), else the plain field.
+    // Where a new todo is typed: a plain field, which shows its cursor only
+    // while it has the keyboard, as a surface module cannot tell.
     const newTodoField = () => {
-      if (hasPointer && (e.surface === 'terminal' || e.surface === 'desktop')) {
-        const { Client } = $.ui.resolve(e)
-
-        return (
-          <Box flexDirection="row" flexGrow={1}>
-            <Text>＋ </Text>
-            <Box flexGrow={1} flexShrink={1}>
-              <Client
-                key="new-todo"
-                module="./note-editor.tsx"
-                props={{
-                  text: '',
-                  isOneLine: true,
-                  isEmptiedOnSubmit: true,
-                  placeholder: 'Add a todo…',
-                }}
-                width="100%"
-              />
-            </Box>
-          </Box>
-        )
-      }
-
       return (
         <Input
           key="new-todo"
@@ -1131,8 +1099,31 @@ export const register: Register = on => {
         (isNoteTab ? session.text !== '' : session.list.length > 0),
     )
 
+    // While a todo is edited in a docked pane, the room under the rows takes
+    // a click as leaving the field: the body is stretched to the pane's rows
+    // and what is left of them listens.
+    const clickAway = (() => {
+      if (editedKey === '' || isNoteTab || !hasPointer) return null
+      if (e.props.placement !== 'dock') return null
+      if (e.surface !== 'terminal' && e.surface !== 'desktop') return null
+      const { Client } = $.ui.resolve(e)
+
+      return (
+        <Client
+          key="click-away"
+          module="./click-away.tsx"
+          width="100%"
+          flexGrow={1}
+        />
+      )
+    })()
+
     return (
-      <Box flexDirection="column" paddingX={1}>
+      <Box
+        flexDirection="column"
+        paddingX={1}
+        {...(clickAway === null ? {} : { minHeight: e.props.scroll.bodyRows })}
+      >
         <Box flexDirection="row" justifyContent="space-between">
           {/* The fold mark leads the heading as a disclosure triangle, the
               same place it takes when the pane is folded. */}
@@ -1173,6 +1164,7 @@ export const register: Register = on => {
             </Text>
           </Button>
         </Box>
+        {clickAway}
       </Box>
     )
   })
