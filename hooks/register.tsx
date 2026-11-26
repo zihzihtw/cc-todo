@@ -104,12 +104,17 @@ type Title = { text: string; isCustom: boolean }
 // transcript: the one given with /rename, else the generated one. The
 // transcript's rows are the engine's own format, so a row that does not read
 // as expected is passed over and no title is an answer.
-const readTitle = async ($: EngineInterface): Promise<Title | undefined> => {
+// `isWholeRead` searches all of it where the end holds no title: a long turn
+// can write more than the tail after the last one.
+const readTitle = async (
+  $: EngineInterface,
+  isWholeRead = false,
+): Promise<Title | undefined> => {
   try {
     const { transcriptPath } = await $.session.info()
     if (transcriptPath === '') return undefined
     const { size } = await $.fs.stat(transcriptPath)
-    const offset = Math.max(0, size - TITLE_TAIL_BYTES)
+    const offset = isWholeRead ? 0 : Math.max(0, size - TITLE_TAIL_BYTES)
     const tail = await $.fs.read(transcriptPath, {
       offset,
       length: size - offset,
@@ -138,12 +143,17 @@ const readTitle = async ($: EngineInterface): Promise<Title | undefined> => {
     if (generated !== undefined && generated !== '') {
       return { text: generated, isCustom: false }
     }
+    if (!isWholeRead && offset > 0) return await readTitle($, true)
 
     return undefined
   } catch {
     return undefined
   }
 }
+
+// This session's title as last read, under its id. A session holding
+// nothing keeps no record, yet its own card is drawn and is named by this.
+let ownTitle: { sessionId: string; text: string } | undefined
 
 // Marks this session as used now and brings its name up to date with the
 // resume list's title. A record is kept only for a session that has todos or
@@ -154,6 +164,8 @@ const touch = async ($: EngineInterface): Promise<void> => {
   const hasTodos =
     toTodos(await $.store.get(LIST_PREFIX + sessionId)).length > 0
   const hasText = typeof (await $.store.get(TEXT_PREFIX + sessionId)) === 'string'
+  const title = await readTitle($)
+  ownTitle = title === undefined ? undefined : { sessionId, text: title.text }
   if (!hasTodos && !hasText) {
     await $.store.delete(key)
 
@@ -161,7 +173,6 @@ const touch = async ($: EngineInterface): Promise<void> => {
   }
 
   const kept = toNote(await $.store.get(key))
-  const title = await readTitle($)
   const note: SessionNote = {
     folder: folderNameOf(await $.session.cwd()),
     usedAt: await $.clock.now(),
@@ -412,7 +423,10 @@ const folderOf = (session: SessionTodos): string =>
   session.note?.folder ?? '?'
 
 const nameOf = (session: SessionTodos): string =>
-  session.note?.name ?? 'Untitled session'
+  session.note?.name ??
+  (session.isOwn && ownTitle?.sessionId === session.sessionId
+    ? ownTitle.text
+    : 'Untitled session')
 
 // When the session was last used, led by its folder where that is not the
 // folder this session runs in.
@@ -643,6 +657,19 @@ export const register: Register = on => {
     await leaveField($, e.element)
 
     return next(e)
+  })
+
+  // The engine titles a session after its first prompt is sent, which is
+  // after that prompt's own reading of the name: the turn's end reads it
+  // again, so the session is named by then and not a prompt later.
+  on('turn.complete', async ($, e, next) => {
+    const ended = await next(e)
+    if (e.agentId === undefined) {
+      await touch($)
+      await redraw($)
+    }
+
+    return ended
   })
 
   // A /rename is no prompt, so the name is read again once it has run.
