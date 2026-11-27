@@ -1,4 +1,8 @@
-import type { ClientKeyEvent, ClientModule } from 'claude-code'
+import type {
+  ClientKeyEvent,
+  ClientModule,
+  ClientPointerEvent,
+} from 'claude-code'
 
 import { cellsOf } from './cells'
 
@@ -6,10 +10,30 @@ import { cellsOf } from './cells'
 // its source, wrapped to the pane's width, and every other line as the
 // markdown it reads as, so a line is seen rendered once the cursor leaves it.
 // Every edit is posted to the hooks module, which stores it.
+//
+// The cursor is drawn only while the editor has the keyboard, so that it
+// shows where typing goes; without it the whole note is drawn as it reads.
+// A surface module is told when it is clicked and when a key reaches it, but
+// not when the keyboard goes elsewhere. The hooks module hears of that, and
+// counts it in `blurs`: the editor has the keyboard while that count is the
+// one it took the keyboard at.
+//
+// Escape hands the keyboard back to the prompt, and raises nothing the hooks
+// module hears. The pane is told whether it has the keyboard, and passes it
+// on as `isPaneFocused`. Whether a pane has it while a surface module of its
+// own does is the engine's to say, so it is learned: once a key has reached
+// the editor while the pane had the keyboard (`sawPane`), the pane losing it
+// is the editor losing it too.
 
-type Props = { text: string }
-// `cursor` counts characters (code points) from the start of `text`.
-type State = { text: string; cursor: number }
+type Props = { text: string; blurs: number; isPaneFocused: boolean }
+// `cursor` counts characters (code points) from the start of `text`;
+// `heldAt` is the count of `blurs` the keyboard was last taken at.
+type State = {
+  text: string
+  cursor: number
+  heldAt?: number
+  sawPane?: true
+}
 // One row as drawn: the characters from `start` up to `end`, a line of the
 // text or the part of one that fits the width.
 type Row = { start: number; end: number }
@@ -95,17 +119,47 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
       cursor: Array.from(props.text).length,
     }
 
+  // What a key that reached the editor shows: it has the keyboard, and
+  // whether the pane had it then too. Only a key shows the latter: at a
+  // click the pane is still as it was before the click.
+  const byKey = (): Pick<State, 'heldAt' | 'sawPane'> => ({
+    heldAt: props.blurs,
+    ...(held().sawPane === true || props.isPaneFocused
+      ? { sawPane: true as const }
+      : {}),
+  })
+
+  // A post replaces one not yet delivered, so every post says the editor
+  // has the keyboard, which the hooks module needs to hear once.
   const edit = (characters: string[], cursor: number): void => {
     const text = characters.join('')
-    surface.setState({ text, cursor })
-    surface.post({ text })
+    surface.setState({ text, cursor, ...byKey() })
+    surface.post({ text, isHeld: true })
   }
 
   const move = (cursor: number): void => {
-    surface.setState({ text: held().text, cursor })
+    surface.setState({ text: held().text, cursor, ...byKey() })
   }
 
+  const hasKeyboard =
+    held().heldAt === props.blurs &&
+    !(held().sawPane === true && !props.isPaneFocused)
+
+  surface.onPointer((event: ClientPointerEvent) => {
+    // A click gives the editor the keyboard.
+    if (event.type !== 'down' || held().heldAt === props.blurs) return
+    surface.setState({ ...held(), heldAt: props.blurs })
+    surface.post({ isHeld: true })
+  })
+
   surface.onKey((event: ClientKeyEvent) => {
+    // Any key that reaches it shows that it has the keyboard, the ones that
+    // do nothing here included.
+    const shown = byKey()
+    if (held().heldAt !== shown.heldAt || held().sawPane !== shown.sawPane) {
+      surface.setState({ ...held(), ...shown })
+      surface.post({ isHeld: true })
+    }
     const { text, cursor } = held()
     const characters = Array.from(text)
     const rows = layOut(characters, columns)
@@ -197,6 +251,17 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
   })
 
   const { text, cursor } = held()
+
+  // Without the keyboard, or in a window that is not the one in front, no
+  // cursor is drawn and no line shows its source.
+  if (!hasKeyboard || !surface.isWindowFocused) {
+    return text.trim() === '' ? (
+      <Text dimColor>Write something…</Text>
+    ) : (
+      <Markdown text={text} />
+    )
+  }
+
   const characters = Array.from(text)
   const rows = layOut(characters, columns)
   const cursorRow = rowOfCursor(rows, cursor)

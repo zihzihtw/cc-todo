@@ -32,6 +32,9 @@ declare module 'claude-code' {
       // The todo whose text is drawn as a field, as `<session id>:<todo id>`;
       // empty while none is edited.
       edited: string
+      // How many times the keyboard left the note editor, which draws its
+      // cursor while this is the count it took the keyboard at.
+      noteBlurs: number
       // The todo being dragged and how many todos away it is held, as
       // `<session id>:<todo id>:<steps>`; empty while none is dragged.
       dragged: string

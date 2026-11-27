@@ -113,6 +113,20 @@ const tidyRecords = async ($: EngineInterface): Promise<void> => {
 const tab = atom({ plugin: 'cc-todo', key: 'tab' } as const, 'todo')
 const edited = atom({ plugin: 'cc-todo', key: 'edited' } as const, '')
 
+// The note editor draws its cursor only while it has the keyboard, and is
+// not told when the keyboard goes elsewhere. That is heard here, and counted:
+// the editor has the keyboard while the count is the one it took it at.
+const noteBlurs = atom({ plugin: 'cc-todo', key: 'noteBlurs' } as const, 0)
+// Whether the editor said it has the keyboard, and nothing took it since.
+let isNoteHeld = false
+
+// The keyboard went to something other than the note editor.
+const blurNote = async ($: EngineInterface): Promise<void> => {
+  if (!isNoteHeld) return
+  isNoteHeld = false
+  await update($, noteBlurs, n => n + 1)
+}
+
 const dragged = atom({ plugin: 'cc-todo', key: 'dragged' } as const, '')
 const isCollapsed = atom(
   { plugin: 'cc-todo', key: 'isCollapsed' } as const,
@@ -171,6 +185,21 @@ const change = (
   lastChange = applied.catch(() => undefined)
 
   return applied
+}
+
+// What the field a new todo is typed in holds, as it last changed: what the
+// field is handed when it is drawn anew, so a todo half typed is not lost.
+let newTodoDraft = ''
+
+// Moves the pane's focus ring onto the field under `key`, so that it takes
+// the keys with no click of its own. What the field shows is drawn by now: a
+// ring that could not be moved leaves the field to a click or the keys.
+const focusOn = async ($: EngineInterface, key: string): Promise<void> => {
+  try {
+    await $.ui.focus({ requestId: PANE, key })
+  } catch {
+    // Nothing to do: see above.
+  }
 }
 
 // Ends the edit of the todo marked as edited, with `value` as its text
@@ -391,7 +420,10 @@ export const register: Register = on => {
     // Minimised or put away for a draft, the pane is not one the person
     // closed for good.
     const isAway = (await read($, isCollapsed)) || (await seatingOf($)).isTucked
-    if (e.id === PANE) drawnSeat = undefined
+    if (e.id === PANE) {
+      drawnSeat = undefined
+      await blurNote($)
+    }
     if (e.id === PANE && e.origin.kind !== 'unload' && !isAway) {
       await seatAs($, DOCKED)
       await $.store.set(CLOSED_KEY, true)
@@ -403,6 +435,8 @@ export const register: Register = on => {
   // A draft that grows long takes the rows of a pane above the prompt, and
   // gives them back once it is short again.
   on('prompt.change', async ($, e, next) => {
+    // A key typed in the prompt: the keyboard is there, not in the note.
+    await blurNote($)
     const isLong = isLongDraft(e.text)
     const seated = await seatingOf($)
     // Nothing to do but where the draft crosses from short to long or back.
@@ -446,6 +480,10 @@ export const register: Register = on => {
     // A post from anything but the field of the todo being edited, the free
     // room under the rows included, is the person having left that field.
     await leaveField($, e.element)
+    // Every post of the editor is made with the keyboard; one of anything
+    // else is a click on it.
+    if (e.element === `note-${sessionId}`) isNoteHeld = true
+    else await blurNote($)
     if (
       e.element === `note-${sessionId}` &&
       typeof posted === 'object' &&
@@ -486,13 +524,18 @@ export const register: Register = on => {
   // pane saves what it holds, as Enter does: the ring moved by a click or
   // the keys, or a button pressed. Its own cancel is left to discard it.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person') await leaveField($, e.element)
+    if (e.origin.kind === 'person') {
+      await leaveField($, e.element)
+      // The ring moved by the person, onto anything but the editor.
+      if (e.element?.startsWith('note-') !== true) await blurNote($)
+    }
 
     return next(e)
   })
 
   on('ui.press', { requestId: PANE }, async ($, e, next) => {
     await leaveField($, e.element)
+    if (e.element?.startsWith('note-') !== true) await blurNote($)
 
     return next(e)
   })
@@ -613,6 +656,7 @@ export const register: Register = on => {
     const isNoteTab = (await read($, tab)) === 'note'
     const editedKey = await read($, edited)
     const draggedKey = await read($, dragged)
+    const blurs = await read($, noteBlurs)
     // The wrapping fields and the drag handle are surface modules, which take
     // the keyboard and the pointer by a click. The terminal reports clicks in
     // its fullscreen layout alone, so elsewhere the plain fields are drawn,
@@ -633,6 +677,10 @@ export const register: Register = on => {
     const field = (session: SessionTodos, one: Todo) => {
       const key = `edit-${session.sessionId}-${one.id}`
       if (fieldDraft?.key !== key) fieldDraft = { key, text: one.text }
+      // The field is handed what was last typed in it, not the todo as kept:
+      // a pane that left the screen and came back draws its fields anew, and
+      // one handed the kept text would have lost the typing.
+      const typed = fieldDraft.text
 
       return (
         <Box flexDirection="row">
@@ -647,9 +695,9 @@ export const register: Register = on => {
           >
             <Input
               key={key}
-              value={one.text}
+              value={typed}
               submitLabel=""
-              rows={linesOf(one)}
+              rows={linesOf({ ...one, text: typed })}
               autoFocus
               onInput={value => {
                 fieldDraft = { key, text: value }
@@ -662,7 +710,11 @@ export const register: Register = on => {
                 label="cancel"
                 plain
                 dimColor
-                onPress={() => update($, edited, () => '')}
+                onPress={() => {
+                  fieldDraft = undefined
+
+                  return update($, edited, () => '')
+                }}
               />
             </Box>
           </Box>
@@ -762,12 +814,7 @@ export const register: Register = on => {
                     edited,
                     () => `${session.sessionId}:${one.id}`,
                   )
-                  // The press gave the pane the keys: the field takes them now,
-                  // with no click of its own.
-                  await $.ui.focus({
-                    requestId: PANE,
-                    key: `edit-${session.sessionId}-${one.id}`,
-                  })
+                  await focusOn($, `edit-${session.sessionId}-${one.id}`)
                 }}
               >
                 {one.isDone ? (
@@ -883,7 +930,11 @@ export const register: Register = on => {
           <Client
             key={`note-${session.sessionId}`}
             module="./note-editor.tsx"
-            props={{ text: session.text }}
+            props={{
+              text: session.text,
+              blurs,
+              isPaneFocused: e.props.isFocused,
+            }}
             width="100%"
           />
         )
@@ -918,9 +969,13 @@ export const register: Register = on => {
           label="＋"
           placeholder="Add a todo…"
           submitLabel=""
-          value=""
+          value={newTodoDraft}
           {...(editedKey === '' ? { autoFocus: true as const } : {})}
+          onInput={value => {
+            newTodoDraft = value
+          }}
           onSubmit={value => {
+            newTodoDraft = ''
             const text = value.trim()
             if (text !== '') void change($, add(text))
           }}
@@ -985,7 +1040,9 @@ export const register: Register = on => {
     // a click as leaving the field: the body is stretched to the pane's rows
     // and what is left of them listens.
     const clickAway = (() => {
-      if (editedKey === '' || isNoteTab || !hasPointer) return null
+      // The same on the Notes tab: a click there takes the editor's cursor
+      // away, as the keyboard is no longer the editor's.
+      if ((!isNoteTab && editedKey === '') || !hasPointer) return null
       if (e.props.placement !== 'dock') return null
       if (e.surface !== 'terminal' && e.surface !== 'desktop') return null
       const { Client } = $.ui.resolve(e)
