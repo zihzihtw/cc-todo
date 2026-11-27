@@ -2,6 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PaneOpenArgs, Register } from 'claude-code'
 
 import type { SessionNote, Todo } from '../types'
+import { cellsOf } from './cells'
+import { folderNameOf, toNote, toText } from './records'
+import { readTitle } from './title'
+import { add, adopt, moveBy, toTodos } from './todos'
 
 const PANE = 'cc-todo'
 const TITLE = 'Todo'
@@ -30,127 +34,6 @@ const isAllShown = atom(
   false,
 )
 
-// The store outlives the code that wrote it, so what it holds is checked
-// before it is trusted.
-const toTodos = (stored: unknown): Todo[] => {
-  if (!Array.isArray(stored)) return []
-
-  const todos: Todo[] = []
-  for (const one of stored) {
-    if (
-      typeof one === 'object' &&
-      one !== null &&
-      typeof one.id === 'number' &&
-      typeof one.text === 'string' &&
-      typeof one.isDone === 'boolean'
-    ) {
-      todos.push({ id: one.id, text: one.text, isDone: one.isDone })
-    }
-  }
-
-  return todos
-}
-
-const folderNameOf = (path: string): string =>
-  path.split('/').filter(Boolean).pop() ?? ''
-
-const toNote = (stored: unknown): SessionNote | undefined => {
-  if (typeof stored !== 'object' || stored === null) return undefined
-  // A record written before only the folder's name was kept holds the whole
-  // path as `cwd`; its last part is all that is read from it.
-  const folder =
-    'folder' in stored && typeof stored.folder === 'string'
-      ? stored.folder
-      : 'cwd' in stored && typeof stored.cwd === 'string'
-        ? folderNameOf(stored.cwd)
-        : undefined
-  if (folder === undefined) return undefined
-  // `changedAt` is what a note written before `usedAt` carries.
-  const usedAt =
-    'usedAt' in stored
-      ? stored.usedAt
-      : 'changedAt' in stored
-        ? stored.changedAt
-        : undefined
-  if (typeof usedAt !== 'number') return undefined
-  const isNameCustom = 'isNameCustom' in stored && stored.isNameCustom === true
-  // An earlier version could name a session by the start of its first
-  // prompt. Only a name marked as read from the transcript is kept, or one
-  // the person gave with /rename, which was always read from there.
-  const isNameFromTitle =
-    isNameCustom ||
-    ('isNameFromTitle' in stored && stored.isNameFromTitle === true)
-  const name =
-    isNameFromTitle && 'name' in stored && typeof stored.name === 'string'
-      ? stored.name
-      : undefined
-  const note: SessionNote = { folder, usedAt }
-  if (name !== undefined) {
-    note.name = name
-    note.isNameFromTitle = true
-  }
-  if (isNameCustom) note.isNameCustom = true
-
-  return note
-}
-
-// How much of the transcript's end is searched for a title: the engine writes
-// the title again as the session goes on, so the newest is near the end.
-const TITLE_TAIL_BYTES = 262144
-
-type Title = { text: string; isCustom: boolean }
-
-// The title the resume list shows, read from the end of the session's
-// transcript: the one given with /rename, else the generated one. The
-// transcript's rows are the engine's own format, so a row that does not read
-// as expected is passed over and no title is an answer.
-// `isWholeRead` searches all of it where the end holds no title: a long turn
-// can write more than the tail after the last one.
-const readTitle = async (
-  $: EngineInterface,
-  isWholeRead = false,
-): Promise<Title | undefined> => {
-  try {
-    const { transcriptPath } = await $.session.info()
-    if (transcriptPath === '') return undefined
-    const { size } = await $.fs.stat(transcriptPath)
-    const offset = isWholeRead ? 0 : Math.max(0, size - TITLE_TAIL_BYTES)
-    const tail = await $.fs.read(transcriptPath, {
-      offset,
-      length: size - offset,
-    })
-
-    let custom: string | undefined
-    let generated: string | undefined
-    for (const line of tail.split('\n')) {
-      if (!line.includes('-title"')) continue
-      try {
-        const row: unknown = JSON.parse(line)
-        if (typeof row !== 'object' || row === null) continue
-        if ('customTitle' in row && typeof row.customTitle === 'string') {
-          custom = row.customTitle
-        }
-        if ('aiTitle' in row && typeof row.aiTitle === 'string') {
-          generated = row.aiTitle
-        }
-      } catch {
-        // The first line of the tail is cut where the range starts.
-      }
-    }
-    if (custom !== undefined && custom !== '') {
-      return { text: custom, isCustom: true }
-    }
-    if (generated !== undefined && generated !== '') {
-      return { text: generated, isCustom: false }
-    }
-    if (!isWholeRead && offset > 0) return await readTitle($, true)
-
-    return undefined
-  } catch {
-    return undefined
-  }
-}
-
 // This session's title as last read, under its id. A session holding
 // nothing keeps no record, yet its own card is drawn and is named by this.
 let ownTitle: { sessionId: string; text: string } | undefined
@@ -163,7 +46,8 @@ const touch = async ($: EngineInterface): Promise<void> => {
   const key = NOTE_PREFIX + sessionId
   const hasTodos =
     toTodos(await $.store.get(LIST_PREFIX + sessionId)).length > 0
-  const hasText = typeof (await $.store.get(TEXT_PREFIX + sessionId)) === 'string'
+  const hasText =
+    typeof (await $.store.get(TEXT_PREFIX + sessionId)) === 'string'
   const title = await readTitle($)
   ownTitle = title === undefined ? undefined : { sessionId, text: title.text }
   if (!hasTodos && !hasText) {
@@ -191,8 +75,6 @@ const touch = async ($: EngineInterface): Promise<void> => {
   await $.store.set(key, note)
 }
 
-// Brings the records an earlier version left to what is kept now: the
-// folder's name in place of its path, and none for a session with nothing.
 // Saves this session's note. The session's record is brought up to date when
 // the note is its first or was its last, so that a session gets its title
 // with its first note and leaves no record once it holds nothing. Other
@@ -209,6 +91,8 @@ const saveNote = async ($: EngineInterface, text: string): Promise<void> => {
   }
 }
 
+// Brings the records an earlier version left to what is kept now: the
+// folder's name in place of its path, and none for a session with nothing.
 const tidyRecords = async ($: EngineInterface): Promise<void> => {
   for (const key of await $.store.keys()) {
     if (!key.startsWith(NOTE_PREFIX)) continue
@@ -234,38 +118,6 @@ const isCollapsed = atom(
   { plugin: 'cc-todo', key: 'isCollapsed' } as const,
   false,
 )
-
-// Moves the todo `id` by `steps` places among the todos that are done as it
-// is (the pane lists the open ones, then the done ones).
-const moveBy =
-  (id: number, steps: number) =>
-  (list: Todo[]): Todo[] => {
-    const moved = list.find(one => one.id === id)
-    if (moved === undefined) return list
-    const group = list.filter(one => one.isDone === moved.isDone)
-    const from = group.indexOf(moved)
-    const to = Math.max(0, Math.min(group.length - 1, from + steps))
-    const target = group[to]
-    if (target === undefined || to === from) return list
-    const rest = list.filter(one => one.id !== id)
-    const at = rest.indexOf(target) + (to > from ? 1 : 0)
-
-    return [...rest.slice(0, at), moved, ...rest.slice(at)]
-  }
-
-// The cells a text takes: two for an East Asian wide character.
-const cellsOf = (text: string): number =>
-  Array.from(text).reduce((sum, character) => {
-    const codePoint = character.codePointAt(0) ?? 0
-    const isWide =
-      (codePoint >= 0x1100 && codePoint <= 0x115f) ||
-      (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
-      (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-      (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-      (codePoint >= 0xff00 && codePoint <= 0xff60)
-
-    return sum + (isWide ? 2 : 1)
-  }, 0)
 
 // What the pane's body loses to the card around a todo's text: the padding,
 // the border, the circle, the margins and the two marks at the row's end.
@@ -356,19 +208,13 @@ const leaveField = async (
   await saveEdited($, fieldDraft.text)
 }
 
-const add = (text: string) => (list: Todo[]) => {
-  const nextId = list.reduce((max, one) => Math.max(max, one.id), 0) + 1
-
-  return [...list, { id: nextId, text, isDone: false }]
-}
-
 // Todos written while the list was shared go to the first session that
-// starts afterwards, so none is lost.
+// starts afterwards, after any it already has, so none is lost.
 const adoptSharedList = async ($: EngineInterface): Promise<void> => {
   const shared = toTodos(await $.store.get(SHARED_KEY))
   if (shared.length === 0) return
 
-  await change($, own => (own.length === 0 ? shared : own))
+  await change($, adopt(shared))
   await $.store.delete(SHARED_KEY)
 }
 
@@ -379,9 +225,6 @@ type SessionTodos = {
   list: Todo[]
   text: string
 }
-
-const toText = (stored: unknown): string =>
-  typeof stored === 'string' ? stored : ''
 
 // This session first, then the others by their latest change; a session
 // with no todo left is not listed.
@@ -419,8 +262,7 @@ const readSessions = async (
 
 const twoDigits = (n: number): string => String(n).padStart(2, '0')
 
-const folderOf = (session: SessionTodos): string =>
-  session.note?.folder ?? '?'
+const folderOf = (session: SessionTodos): string => session.note?.folder ?? '?'
 
 const nameOf = (session: SessionTodos): string =>
   session.note?.name ??
@@ -537,8 +379,7 @@ export const register: Register = on => {
     await redraw($)
     // A reload runs this again: a pane the person closed, minimised or that
     // is put away for a draft stays as it is.
-    const isAway =
-      (await read($, isCollapsed)) || (await seatingOf($)).isTucked
+    const isAway = (await read($, isCollapsed)) || (await seatingOf($)).isTucked
     if (!isAway && (await $.store.get(CLOSED_KEY)) !== true) {
       void $.ui.open(SEAT)
     }
@@ -547,11 +388,9 @@ export const register: Register = on => {
   })
 
   on('ui.close', async ($, e, next) => {
-    // Put away for a draft, the pane is not one the person closed.
     // Minimised or put away for a draft, the pane is not one the person
     // closed for good.
-    const isAway =
-      (await read($, isCollapsed)) || (await seatingOf($)).isTucked
+    const isAway = (await read($, isCollapsed)) || (await seatingOf($)).isTucked
     if (e.id === PANE) drawnSeat = undefined
     if (e.id === PANE && e.origin.kind !== 'unload' && !isAway) {
       await seatAs($, DOCKED)
@@ -561,8 +400,8 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A /clear or a resume changes the session without a session.start: the
-  // next prompt draws the list of the session it belongs to.
+  // A draft that grows long takes the rows of a pane above the prompt, and
+  // gives them back once it is short again.
   on('prompt.change', async ($, e, next) => {
     const isLong = isLongDraft(e.text)
     const seated = await seatingOf($)
@@ -571,10 +410,7 @@ export const register: Register = on => {
       const isInline =
         drawnSeat === undefined ? seated.isInline : drawnSeat === 'inline'
       const isPutAway =
-        isLong &&
-        isInline &&
-        !seated.isTucked &&
-        !(await read($, isCollapsed))
+        isLong && isInline && !seated.isTucked && !(await read($, isCollapsed))
       await seatAs($, {
         isInline: seated.isInline || isPutAway,
         isDraftLong: isLong,
@@ -586,6 +422,8 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A /clear or a resume changes the session without a session.start: the
+  // next prompt draws the list of the session it belongs to.
   on('prompt.submit', async ($, e, next) => {
     // The prompt is sent: the draft is gone, and a pane put away for it
     // comes back. One the person minimised stays minimised.
@@ -688,7 +526,6 @@ export const register: Register = on => {
     // Above the prompt the pane shares the screen's height with the prompt
     // box, so it asks for a few rows and scrolls, leaving room to type.
     const isDocked = isFullscreen && columns >= DOCK_MIN_COLUMNS
-    const seat = SEAT
     await seatAs($, !isDocked && text !== 'close' ? INLINE : DOCKED)
     // Asking for the pane brings it back from minimised.
     await update($, isCollapsed, () => false)
@@ -711,14 +548,14 @@ export const register: Register = on => {
 
     if (text === 'note') {
       await update($, tab, () => 'note')
-      await $.ui.open({ ...seat, focus: true })
+      await $.ui.open({ ...SEAT, focus: true })
 
       return { text: `Notes tab opened.${whereDrawn}` }
     }
 
     if (text === 'all') {
       await update($, isAllShown, () => true)
-      await $.ui.open({ ...seat, focus: true })
+      await $.ui.open({ ...SEAT, focus: true })
 
       return { text: `Showing all sessions.${whereDrawn}` }
     }
@@ -726,14 +563,14 @@ export const register: Register = on => {
     if (text !== '') {
       await update($, tab, () => 'todo')
       await change($, add(text))
-      await $.ui.open(seat)
+      await $.ui.open(SEAT)
 
       return { text: `Added: ${text}` }
     }
 
     await update($, isAllShown, () => false)
     await redraw($)
-    await $.ui.open({ ...seat, focus: true })
+    await $.ui.open({ ...SEAT, focus: true })
 
     return { text: `Todo pane opened.${whereDrawn}` }
   })
@@ -788,8 +625,7 @@ export const register: Register = on => {
     const linesOf = (one: Todo): number =>
       Math.max(1, Math.ceil(cellsOf(one.text) / textColumns))
     const sessions = await readSessions($, isEverySession)
-    const ownFolder =
-      (await $.session.cwd()).split('/').filter(Boolean).pop() ?? ''
+    const ownFolder = folderNameOf(await $.session.cwd())
 
     // The row of the todo being edited: its text in a plain field as tall as
     // the text's lines. A plain field takes the keyboard as it is drawn, which
@@ -803,7 +639,12 @@ export const register: Register = on => {
           <Text color={one.isDone ? DONE : BORDER}>
             {one.isDone ? '●' : '○'}
           </Text>
-          <Box flexDirection="column" flexGrow={1} flexShrink={1} marginLeft={1}>
+          <Box
+            flexDirection="column"
+            flexGrow={1}
+            flexShrink={1}
+            marginLeft={1}
+          >
             <Input
               key={key}
               value={one.text}
@@ -831,7 +672,11 @@ export const register: Register = on => {
 
     // The handle a todo is dragged by, where the surface draws one. It is
     // told how many lines the todos around it take, to read the pointer's row.
-    const dragHandle = (session: SessionTodos, group: Todo[], index: number) => {
+    const dragHandle = (
+      session: SessionTodos,
+      group: Todo[],
+      index: number,
+    ) => {
       if (!hasPointer) return null
       if (e.surface !== 'terminal' && e.surface !== 'desktop') return null
       const { Client } = $.ui.resolve(e)
@@ -875,85 +720,89 @@ export const register: Register = on => {
           drop !== undefined && drop.to === index && drop.to !== drop.from
 
         return editedKey === `${session.sessionId}:${one.id}` ? (
-        field(session, one)
-      ) : (
-      <Box flexDirection="row">
-        <Button
-          key={`toggle-${session.sessionId}-${one.id}`}
-          plain
-          onPress={() =>
-            change(
-              $,
-              all =>
-                all.map(each =>
-                  each.id === one.id
-                    ? { ...each, isDone: !each.isDone }
-                    : each,
-                ),
-              session.sessionId,
-            )
-          }
-        >
-          {isTarget ? (
-            <Text color={MARK}>
-              {drop !== undefined && drop.to > drop.from ? '▼' : '▲'}
-            </Text>
-          ) : one.isDone ? (
-            <Text color={DONE}>●</Text>
-          ) : (
-            <Text color={BORDER}>○</Text>
-          )}
-        </Button>
-        {/* The text has the row's free width and wraps within it, so its
+          field(session, one)
+        ) : (
+          <Box flexDirection="row">
+            <Button
+              key={`toggle-${session.sessionId}-${one.id}`}
+              plain
+              onPress={() =>
+                change(
+                  $,
+                  all =>
+                    all.map(each =>
+                      each.id === one.id
+                        ? { ...each, isDone: !each.isDone }
+                        : each,
+                    ),
+                  session.sessionId,
+                )
+              }
+            >
+              {isTarget ? (
+                <Text color={MARK}>
+                  {drop !== undefined && drop.to > drop.from ? '▼' : '▲'}
+                </Text>
+              ) : one.isDone ? (
+                <Text color={DONE}>●</Text>
+              ) : (
+                <Text color={BORDER}>○</Text>
+              )}
+            </Button>
+            {/* The text has the row's free width and wraps within it, so its
             later lines start under its first, past the circle. Pressing it
             turns the row into the field that edits it. */}
-        <Box flexGrow={1} flexShrink={1} marginLeft={1} marginRight={1}>
-          <Button
-            key={`edit-button-${session.sessionId}-${one.id}`}
-            plain
-            onPress={async () => {
-              await update($, edited, () => `${session.sessionId}:${one.id}`)
-              // The press gave the pane the keys: the field takes them now,
-              // with no click of its own.
-              await $.ui.focus({
-                requestId: PANE,
-                key: `edit-${session.sessionId}-${one.id}`,
-              })
-            }}
-          >
-            {one.isDone ? (
-              <Text dimColor strikethrough wrap="wrap">
-                {one.text}
-              </Text>
-            ) : (
-              <Text
-                wrap="wrap"
-                dimColor={isDragged}
-                {...(isTarget ? { color: MARK } : {})}
+            <Box flexGrow={1} flexShrink={1} marginLeft={1} marginRight={1}>
+              <Button
+                key={`edit-button-${session.sessionId}-${one.id}`}
+                plain
+                onPress={async () => {
+                  await update(
+                    $,
+                    edited,
+                    () => `${session.sessionId}:${one.id}`,
+                  )
+                  // The press gave the pane the keys: the field takes them now,
+                  // with no click of its own.
+                  await $.ui.focus({
+                    requestId: PANE,
+                    key: `edit-${session.sessionId}-${one.id}`,
+                  })
+                }}
               >
-                {one.text}
-              </Text>
-            )}
-          </Button>
-        </Box>
-        <Box flexDirection="row" gap={1} flexShrink={0}>
-        {dragHandle(session, group, index)}
-        <Button
-          key={`remove-${session.sessionId}-${one.id}`}
-          label="×"
-          plain
-          dimColor
-          onPress={() =>
-            change(
-              $,
-              all => all.filter(each => each.id !== one.id),
-              session.sessionId,
-            )
-          }
-        />
-        </Box>
-      </Box>
-      )
+                {one.isDone ? (
+                  <Text dimColor strikethrough wrap="wrap">
+                    {one.text}
+                  </Text>
+                ) : (
+                  <Text
+                    wrap="wrap"
+                    dimColor={isDragged}
+                    {...(isTarget ? { color: MARK } : {})}
+                  >
+                    {one.text}
+                  </Text>
+                )}
+              </Button>
+            </Box>
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              {dragHandle(session, group, index)}
+              <Button
+                key={`remove-${session.sessionId}-${one.id}`}
+                label="×"
+                plain
+                dimColor
+                onPress={() =>
+                  change(
+                    $,
+                    all => all.filter(each => each.id !== one.id),
+                    session.sessionId,
+                  )
+                }
+              />
+            </Box>
+          </Box>
+        )
       }
 
     const card = (session: SessionTodos) => {
@@ -994,7 +843,9 @@ export const register: Register = on => {
             <Box flexDirection="row" justifyContent="space-between">
               <Button
                 key={`hide-done-${session.sessionId}`}
-                label={isDoneHidden ? `Show done (${done.length})` : 'Hide done'}
+                label={
+                  isDoneHidden ? `Show done (${done.length})` : 'Hide done'
+                }
                 plain
                 dimColor
                 onPress={async () => {
@@ -1102,7 +953,11 @@ export const register: Register = on => {
       const isShown = (id === 'note') === isNoteTab
 
       return (
-        <Button key={`tab-${id}`} plain onPress={() => update($, tab, () => id)}>
+        <Button
+          key={`tab-${id}`}
+          plain
+          onPress={() => update($, tab, () => id)}
+        >
           {isShown ? (
             <Text bold underline color={MARK}>
               {label}
