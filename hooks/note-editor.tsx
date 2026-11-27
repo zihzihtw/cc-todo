@@ -1,20 +1,13 @@
 import type { ClientKeyEvent, ClientModule } from 'claude-code'
 
+import { cellsOf } from './cells'
+
 // A small markdown editor in one block: the line the cursor is on is drawn as
 // its source, wrapped to the pane's width, and every other line as the
 // markdown it reads as, so a line is seen rendered once the cursor leaves it.
 // Every edit is posted to the hooks module, which stores it.
 
-// `isOneLine` makes it a field for one line of plain text, a todo's: no
-// markdown is drawn, Enter posts the text as `submit` and edits post nothing.
-// `isEmptiedOnSubmit` empties the field once it has posted, for the field
-// new todos are typed in; `placeholder` is drawn dim while it holds nothing.
-type Props = {
-  text: string
-  isOneLine?: boolean
-  isEmptiedOnSubmit?: boolean
-  placeholder?: string
-}
+type Props = { text: string }
 // `cursor` counts characters (code points) from the start of `text`.
 type State = { text: string; cursor: number }
 // One row as drawn: the characters from `start` up to `end`, a line of the
@@ -31,21 +24,6 @@ const UNUSED_KEYS = [
   'wheelup',
   'wheeldown',
 ]
-
-// East Asian wide and fullwidth characters take two cells.
-const isWide = (codePoint: number): boolean =>
-  (codePoint >= 0x1100 && codePoint <= 0x115f) ||
-  (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
-  (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-  (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-  (codePoint >= 0xfe30 && codePoint <= 0xfe4f) ||
-  (codePoint >= 0xff00 && codePoint <= 0xff60) ||
-  (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-  (codePoint >= 0x1f300 && codePoint <= 0x1faff) ||
-  (codePoint >= 0x20000 && codePoint <= 0x3fffd)
-
-const cellsOf = (character: string): number =>
-  isWide(character.codePointAt(0) ?? 0) ? 2 : 1
 
 // Breaks the text into the rows drawn, each at most `columns` cells wide.
 const layOut = (characters: string[], columns: number): Row[] => {
@@ -83,11 +61,7 @@ const rowOfCursor = (rows: Row[], cursor: number): number => {
   return found
 }
 
-const cellsBefore = (
-  characters: string[],
-  row: Row,
-  cursor: number,
-): number =>
+const cellsBefore = (characters: string[], row: Row, cursor: number): number =>
   characters
     .slice(row.start, cursor)
     .reduce((sum, character) => sum + cellsOf(character), 0)
@@ -109,10 +83,11 @@ const cursorAt = (characters: string[], row: Row, cells: number): number => {
 const NoteEditor: ClientModule<Props, State> = (props, surface) => {
   const { Box, Text, Markdown } = surface.elements
   // The widest row leaves a cell for the cursor at its end.
-  // and, in a one-line field, two more for the Enter mark after the text.
   const columns =
-    Math.max(8, surface.columns === 0 ? COLUMNS_BEFORE_LAYOUT : surface.columns) -
-    (props.isOneLine === true ? 3 : 1)
+    Math.max(
+      8,
+      surface.columns === 0 ? COLUMNS_BEFORE_LAYOUT : surface.columns,
+    ) - 1
 
   const held = (): State =>
     surface.state ?? {
@@ -120,12 +95,10 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
       cursor: Array.from(props.text).length,
     }
 
-  const isOneLine = props.isOneLine === true
-
   const edit = (characters: string[], cursor: number): void => {
     const text = characters.join('')
     surface.setState({ text, cursor })
-    if (!isOneLine) surface.post({ text })
+    surface.post({ text })
   }
 
   const move = (cursor: number): void => {
@@ -207,14 +180,7 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
         break
       case 'return':
       case 'enter':
-        if (!isOneLine) {
-          insert('\n')
-          break
-        }
-        surface.post({ submit: text })
-        if (props.isEmptiedOnSubmit === true) {
-          surface.setState({ text: '', cursor: 0 })
-        }
+        insert('\n')
         break
       case 'tab':
         insert('  ')
@@ -226,11 +192,7 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
         if (UNUSED_KEYS.includes(event.key)) break
         if (/^f\d{1,2}$/.test(event.key)) break
         // A paste arrives as one key; its line ends become plain newlines.
-        insert(
-          isOneLine
-            ? event.key.replace(/[\r\n]+/g, ' ')
-            : event.key.replace(/\r\n?/g, '\n'),
-        )
+        insert(event.key.replace(/\r\n?/g, '\n'))
     }
   })
 
@@ -241,16 +203,10 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
 
   const drawRow = (row: Row, index: number) => {
     const line = characters.slice(row.start, row.end)
-    // A one-line field marks its end with what Enter does, right after the
-    // text as a text field does.
-    const enterMark = isOneLine && index === rows.length - 1 && (
-      <Text dimColor> ⏎</Text>
-    )
     if (index !== cursorRow) {
       return (
         <Box flexDirection="row">
           <Text>{line.length === 0 ? ' ' : line.join('')}</Text>
-          {enterMark}
         </Box>
       )
     }
@@ -261,21 +217,7 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
         <Text>{line.slice(0, at).join('')}</Text>
         <Text inverse>{line[at] ?? ' '}</Text>
         <Text>{line.slice(at + 1).join('')}</Text>
-        {text === '' && props.placeholder !== undefined && (
-          <Text dimColor>{props.placeholder}</Text>
-        )}
-        {enterMark}
-        {text === '' && !isOneLine && (
-          <Text dimColor> Write something…</Text>
-        )}
-      </Box>
-    )
-  }
-
-  if (isOneLine) {
-    return (
-      <Box flexDirection="column">
-        {rows.map((row, index) => drawRow(row, index))}
+        {text === '' && <Text dimColor> Write something…</Text>}
       </Box>
     )
   }
@@ -314,9 +256,10 @@ const NoteEditor: ClientModule<Props, State> = (props, surface) => {
       }
     }
     const opening = lines[firstSource]
-    const isCursorOnClosing = fencesBefore % 2 === 1 && lastSource !== firstSource
-      ? cursorLine !== undefined && isFence(cursorLine)
-      : false
+    const isCursorOnClosing =
+      fencesBefore % 2 === 1 && lastSource !== firstSource
+        ? cursorLine !== undefined && isFence(cursorLine)
+        : false
     if (opening !== undefined && !isCursorOnClosing) {
       while (lastSource < lines.length - 1) {
         lastSource += 1

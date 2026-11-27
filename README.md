@@ -59,9 +59,20 @@ For a session that has todos or a note, the store holds:
 
 The title, folder name and time are refreshed when the session starts, on each prompt and when a todo changes. A session with no todos and no note keeps no record at all.
 
-The title is the one the resume list shows. To get it, the plugin reads up to the last 256 KiB of the session's transcript file, takes the title from it and keeps that title in its store on your machine. That file is an internal format, so the title may become unreadable in a future Claude Code: a session with neither a readable title nor one already kept shows as `Untitled session`.
+The title is the one the resume list shows. To get it, the plugin reads the end of the session's transcript file, 256 KiB at a time and no further back than 8 MiB, takes the title from it and keeps that title in its store on your machine. After that it reads only what the session has written since. That file is an internal format, so the title may become unreadable in a future Claude Code: a session with neither a readable title nor one already kept shows as `Untitled session`.
 
 The store is plain text and is never cleaned up by Claude Code, so a session's todos and note stay until you clear them in the pane.
+
+## Develop
+
+Check the plugin as Claude Code will read it, and run its tests:
+
+```sh
+claude plugin validate .
+claude plugin test .
+```
+
+The code is formatted with Prettier, by `.prettierrc.json`.
 
 ## License
 
