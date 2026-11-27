@@ -35,7 +35,7 @@ Without it the pane still works, with less: it is drawn above the prompt instead
 In the pane:
 
 - **Todo** — click the circle to tick a todo, its text to edit it, `×` to remove it, and drag `≡` to reorder. An edit is saved on Enter or by clicking elsewhere in the pane; `cancel` drops it. `Hide done` folds finished todos away; `Clear done` deletes them.
-- **Notes** — a small markdown editor. The line under the cursor shows its source; every other line is rendered. Edits save as you type.
+- **Notes** — a small markdown editor. Click it to type: the cursor shows only while the editor has the keyboard, the line under it shows its source and every other line is rendered. Without the keyboard the whole note is rendered. Edits save as you type. With an input method, the text being composed is shown at the prompt and lands in the note once chosen.
 - **All sessions** — one card per session, named by the title the resume list shows.
 
 In the fullscreen layout the fields are click-to-focus: click one, type, and press Esc to hand the keyboard back to the prompt. Elsewhere, press ctrl+x then tab to move the keyboard to the pane.

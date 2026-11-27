@@ -61,6 +61,7 @@ const session = (
   on('clock.now', () => ({ value: 1000 }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.change', (_, e) => ({ text: e.text }) as never)
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => {
     store.set(e.key, e.value)
@@ -261,4 +262,95 @@ test('a todo typed in the pane is kept, with a record of its session', async ($,
     name: 'Typing',
     isNameFromTitle: true,
   })
+})
+
+test('the note shows its cursor only while it has the keyboard', async ($, on) => {
+  session(on, {
+    id: 'held',
+    text: generated('Held'),
+    stored: { 'text:held': '# 待辦\n- one' },
+  })
+  await start($)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-note' })
+  const cursor = async () =>
+    (await ui.findAll({ type: 'Text', in: 'note-held' })).find(
+      one => one.props.inverse === true,
+    )
+  const read = () => ui.find({ type: 'Markdown', in: 'note-held' })
+
+  // At rest the note reads whole, with no cursor.
+  expect(await cursor()).toBeUndefined()
+  expect((await read())?.props.text).toBe('# 待辦\n- one')
+
+  // A click gives it the keyboard: the cursor shows, on a line of source.
+  await ui.pointer({ type: 'down', x: 0, y: 0, in: 'note-held' })
+  expect(await cursor()).toBeDefined()
+  expect((await read())?.props.text).toBe('# 待辦')
+
+  // Pressing anything else in the pane takes the keyboard away.
+  await ui.press({ key: 'toggle-scope' })
+  expect(await cursor()).toBeUndefined()
+  expect((await read())?.props.text).toBe('# 待辦\n- one')
+
+  // A key that reaches it shows it has the keyboard again.
+  await ui.key({ key: '!', in: 'note-held' })
+  expect(await cursor()).toBeDefined()
+
+  // A click on the free room under the note takes it away too.
+  await ui.pointer({ type: 'down', x: 0, y: 0, in: 'click-away' })
+  expect(await cursor()).toBeUndefined()
+  await ui.pointer({ type: 'down', x: 0, y: 0, in: 'note-held' })
+  expect(await cursor()).toBeDefined()
+
+  // So does typing in the prompt take it away.
+  const typing = $.prompt as unknown as {
+    change: (e: { text: string }) => Promise<unknown>
+  }
+  await typing.change({ text: 'a' })
+  expect(await cursor()).toBeUndefined()
+  expect((await read())?.props.text).toBe('# 待辦\n- one!')
+
+  // Escape hands the keyboard back with nothing raised: the pane losing it
+  // is what shows, once a key reached the editor while the pane had it.
+  await ui.redraw({ ...PANE.props, isFocused: true })
+  await ui.key({ key: '?', in: 'note-held' })
+  expect(await cursor()).toBeDefined()
+  await ui.redraw({ ...PANE.props, isFocused: false })
+  expect(await cursor()).toBeUndefined()
+  await ui.redraw({ ...PANE.props, isFocused: true })
+  expect(await cursor()).toBeDefined()
+  await ui.unmount()
+})
+
+test('what is half typed is still in its field when the pane comes back', async ($, on) => {
+  session(on, {
+    id: 'away',
+    text: generated('Away'),
+    stored: { 'items:away': [{ id: 1, text: 'kept', isDone: false }] },
+  })
+  await start($)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    // Typed, with nothing sent, then the pane leaves the screen.
+    const before = await $.ui.mount({ ...PANE, surface })
+    await before.input({ key: 'new-todo', text: 'half a todo', kind: 'change' })
+    await before.press({ key: 'edit-button-away-1' })
+    await before.input({ key: 'edit-away-1', text: 'kept and', kind: 'change' })
+    await before.unmount()
+
+    const after = await $.ui.mount({ ...PANE, surface })
+    const held = async (key: string) => (await after.find({ key }))?.props.value
+    expect(await held('new-todo')).toBe('half a todo')
+    expect(await held('edit-away-1')).toBe('kept and')
+
+    // Cancelled, the todo is as it was kept, and so is its field next time.
+    await after.press({ key: 'cancel-edit-away-1' })
+    await after.press({ key: 'edit-button-away-1' })
+    expect(await held('edit-away-1')).toBe('kept')
+    await after.press({ key: 'cancel-edit-away-1' })
+    await after.input({ key: 'new-todo', text: '' })
+    await after.unmount()
+  }
 })
